@@ -1,6 +1,103 @@
+<?php
+declare(strict_types=1);
 
+session_start();
+
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+$errors = [];
+$successMessage = null;
+$emailValue = '';
+$passwordMinimumLength = 8;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $submittedToken = (string)($_POST['csrf_token'] ?? '');
+    $emailValue = trim((string)($_POST['email'] ?? ''));
+    $passwordValue = (string)($_POST['password'] ?? '');
+
+    if ($submittedToken === '' || !hash_equals($_SESSION['csrf_token'], $submittedToken)) {
+        $errors[] = 'La session a expiré, veuillez recharger la page et réessayer.';
+    } else {
+        $emailNormalized = null;
+        if ($emailValue === '' || filter_var($emailValue, FILTER_VALIDATE_EMAIL) === false) {
+            $errors[] = 'Veuillez saisir une adresse e-mail valide.';
+        } else {
+            $emailNormalized = strtolower($emailValue);
+        }
+
+        if ($passwordValue === '' || strlen($passwordValue) < $passwordMinimumLength) {
+            $errors[] = sprintf('Le mot de passe doit contenir au moins %d caractères.', $passwordMinimumLength);
+        }
+
+        if (empty($errors) && $emailNormalized !== null) {
+            $pdo = null;
+            try {
+                $dbHost = getenv('DB_HOST') ?: 'localhost';
+                $dbName = getenv('DB_NAME') ?: 'soft_ui_dashboard';
+                $dbUser = getenv('DB_USER') ?: 'root';
+                $dbPassword = getenv('DB_PASSWORD') ?: '';
+
+                $dsn = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $dbHost, $dbName);
+                $pdo = new PDO($dsn, $dbUser, $dbPassword, [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                ]);
+
+                $pdo->beginTransaction();
+
+                $select = $pdo->prepare('SELECT id, password_hash FROM users WHERE email = :email LIMIT 1');
+                $select->execute(['email' => $emailNormalized]);
+                $existingUser = $select->fetch();
+
+                $ipAddress = $_SERVER['REMOTE_ADDR'] ?? null;
+
+                if ($existingUser === false) {
+                    $passwordHash = password_hash($passwordValue, PASSWORD_DEFAULT);
+
+                    $insert = $pdo->prepare('INSERT INTO users (email, password_hash, created_at, updated_at, last_login_at, last_login_ip) VALUES (:email, :password_hash, NOW(), NOW(), NOW(), :last_login_ip)');
+                    $insert->execute([
+                        'email' => $emailNormalized,
+                        'password_hash' => $passwordHash,
+                        'last_login_ip' => $ipAddress,
+                    ]);
+
+                    $successMessage = 'Compte créé et connexion effectuée.';
+                } elseif (!password_verify($passwordValue, $existingUser['password_hash'])) {
+                    $errors[] = 'Les identifiants fournis sont incorrects.';
+                } else {
+                    $update = $pdo->prepare('UPDATE users SET updated_at = NOW(), last_login_at = NOW(), last_login_ip = :last_login_ip WHERE id = :id');
+                    $update->execute([
+                        'last_login_ip' => $ipAddress,
+                        'id' => $existingUser['id'],
+                    ]);
+
+                    $successMessage = 'Connexion réussie.';
+                }
+
+                if (empty($errors)) {
+                    $pdo->commit();
+                    session_regenerate_id(true);
+                    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+                    $emailValue = '';
+                } else {
+                    $pdo->rollBack();
+                }
+            } catch (PDOException $exception) {
+                if ($pdo instanceof PDO && $pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                error_log('Erreur de base de données: ' . $exception->getMessage());
+                $errors[] = 'Une erreur est survenue lors du traitement de votre demande. Veuillez réessayer plus tard.';
+            }
+        }
+    }
+}
+?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
   <head>
     <meta charset="UTF-8" />
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
@@ -134,35 +231,64 @@
                     <p class="mb-0">Enter your email and password to sign in</p>
                   </div>
                   <div class="flex-auto p-6">
-                    <form role="form">
+                    <?php if (!empty($errors)) : ?>
+                      <div class="p-4 mb-4 text-sm text-red-700 rounded-lg bg-red-500/10" role="alert">
+                        <ul class="pl-5 mb-0 list-disc">
+                          <?php foreach ($errors as $error) : ?>
+                            <li><?php echo htmlspecialchars($error, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></li>
+                          <?php endforeach; ?>
+                        </ul>
+                      </div>
+                    <?php endif; ?>
+                    <?php if ($successMessage !== null) : ?>
+                      <div class="p-4 mb-4 text-sm text-emerald-700 rounded-lg bg-emerald-500/10" role="status">
+                        <?php echo htmlspecialchars($successMessage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>
+                      </div>
+                    <?php endif; ?>
+                    <form
+                      role="form"
+                      method="post"
+                      action="<?php echo htmlspecialchars($_SERVER['PHP_SELF'] ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>">
+                      <input
+                        type="hidden"
+                        name="csrf_token"
+                        value="<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>" />
                       <label class="mb-2 ml-1 font-bold text-xs text-slate-700"
                         >Email</label
                       >
                       <div class="mb-4">
                         <input
                           type="email"
+                          name="email"
+                          value="<?php echo htmlspecialchars($emailValue, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>"
                           class="focus:shadow-soft-primary-outline text-sm leading-5.6 ease-soft block w-full appearance-none rounded-lg border border-solid border-gray-300 bg-white bg-clip-padding px-3 py-2 font-normal text-gray-700 transition-all focus:border-fuchsia-300 focus:outline-none focus:transition-shadow"
                           placeholder="Email"
                           aria-label="Email"
-                          aria-describedby="email-addon" />
+                          aria-describedby="email-addon"
+                          autocomplete="email"
+                          required />
                       </div>
                       <label class="mb-2 ml-1 font-bold text-xs text-slate-700"
                         >Password</label
                       >
                       <div class="mb-4">
                         <input
-                          type="email"
+                          type="password"
+                          name="password"
                           class="focus:shadow-soft-primary-outline text-sm leading-5.6 ease-soft block w-full appearance-none rounded-lg border border-solid border-gray-300 bg-white bg-clip-padding px-3 py-2 font-normal text-gray-700 transition-all focus:border-fuchsia-300 focus:outline-none focus:transition-shadow"
                           placeholder="Password"
                           aria-label="Password"
-                          aria-describedby="password-addon" />
+                          aria-describedby="password-addon"
+                          autocomplete="current-password"
+                          required />
                       </div>
                       <div class="min-h-6 mb-0.5 block pl-12">
                         <input
                           id="rememberMe"
+                          name="remember_me"
                           class="mt-0.54 rounded-10 duration-250 ease-soft-in-out after:rounded-circle after:shadow-soft-2xl after:duration-250 checked:after:translate-x-5.25 h-5 relative float-left -ml-12 w-10 cursor-pointer appearance-none border border-solid border-gray-200 bg-slate-800/10 bg-none bg-contain bg-left bg-no-repeat align-top transition-all after:absolute after:top-px after:h-4 after:w-4 after:translate-x-px after:bg-white after:content-[''] checked:border-slate-800/95 checked:bg-slate-800/95 checked:bg-none checked:bg-right"
                           type="checkbox"
-                          checked="" />
+                          value="1" />
                         <label
                           class="mb-2 ml-1 font-normal cursor-pointer select-none text-sm text-slate-700"
                           for="rememberMe"
@@ -171,7 +297,7 @@
                       </div>
                       <div class="text-center">
                         <button
-                          type="button"
+                          type="submit"
                           class="inline-block w-full px-6 py-3 mt-6 mb-0 font-bold text-center text-white uppercase align-middle transition-all bg-transparent border-0 rounded-lg cursor-pointer shadow-soft-md bg-x-25 bg-150 leading-pro text-xs ease-soft-in tracking-tight-soft bg-gradient-to-tl from-blue-600 to-cyan-400 hover:scale-102 hover:shadow-soft-xs active:opacity-85">
                           Sign in
                         </button>
