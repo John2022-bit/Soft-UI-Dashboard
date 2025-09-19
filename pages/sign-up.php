@@ -1,3 +1,109 @@
+<?php
+declare(strict_types=1);
+
+session_start();
+
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+$errors = [];
+$successMessage = null;
+$nameValue = '';
+$emailValue = '';
+$termsAccepted = true;
+$nameMaximumLength = 255;
+$passwordMinimumLength = 8;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $submittedToken = (string)($_POST['csrf_token'] ?? '');
+    $nameValue = trim((string)($_POST['name'] ?? ''));
+    $emailValue = trim((string)($_POST['email'] ?? ''));
+    $passwordValue = (string)($_POST['password'] ?? '');
+    $termsAccepted = isset($_POST['terms']);
+
+    if ($submittedToken === '' || !hash_equals($_SESSION['csrf_token'], $submittedToken)) {
+        $errors[] = 'La session a expiré, veuillez recharger la page et réessayer.';
+    } else {
+        if ($nameValue === '') {
+            $errors[] = 'Veuillez saisir votre nom.';
+        } else {
+            $nameLength = function_exists('mb_strlen') ? mb_strlen($nameValue, 'UTF-8') : strlen($nameValue);
+            if ($nameLength > $nameMaximumLength) {
+                $errors[] = sprintf('Le nom doit contenir au maximum %d caractères.', $nameMaximumLength);
+            }
+        }
+
+        $emailNormalized = null;
+        if ($emailValue === '' || filter_var($emailValue, FILTER_VALIDATE_EMAIL) === false) {
+            $errors[] = 'Veuillez saisir une adresse e-mail valide.';
+        } else {
+            $emailNormalized = strtolower($emailValue);
+        }
+
+        if ($passwordValue === '' || strlen($passwordValue) < $passwordMinimumLength) {
+            $errors[] = sprintf('Le mot de passe doit contenir au moins %d caractères.', $passwordMinimumLength);
+        }
+
+        if (!$termsAccepted) {
+            $errors[] = 'Vous devez accepter les conditions d\'utilisation.';
+        }
+
+        if (empty($errors) && $emailNormalized !== null) {
+            $pdo = null;
+            try {
+                $dbHost = getenv('DB_HOST') ?: 'localhost';
+                $dbName = getenv('DB_NAME') ?: 'soft_ui_dashboard';
+                $dbUser = getenv('DB_USER') ?: 'root';
+                $dbPassword = getenv('DB_PASSWORD') ?: '';
+
+                $dsn = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $dbHost, $dbName);
+                $pdo = new PDO($dsn, $dbUser, $dbPassword, [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                ]);
+
+                $pdo->beginTransaction();
+
+                $select = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+                $select->execute(['email' => $emailNormalized]);
+                $existingUser = $select->fetch();
+
+                if ($existingUser !== false) {
+                    $errors[] = 'Un compte existe déjà avec cette adresse e-mail.';
+                } else {
+                    $passwordHash = password_hash($passwordValue, PASSWORD_DEFAULT);
+                    $insert = $pdo->prepare('INSERT INTO users (email, password_hash, created_at, updated_at) VALUES (:email, :password_hash, NOW(), NOW())');
+                    $insert->execute([
+                        'email' => $emailNormalized,
+                        'password_hash' => $passwordHash,
+                    ]);
+
+                    $successMessage = 'Votre compte a été créé avec succès. Vous pouvez maintenant vous connecter.';
+                    $nameValue = '';
+                    $emailValue = '';
+                    $termsAccepted = true;
+                    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+                }
+
+                if (empty($errors)) {
+                    $pdo->commit();
+                } else {
+                    $pdo->rollBack();
+                }
+            } catch (PDOException $exception) {
+                if ($pdo instanceof PDO && $pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+
+                error_log('Erreur de base de données lors de la création d\'un utilisateur: ' . $exception->getMessage());
+                $errors[] = 'Une erreur est survenue lors de la création du compte. Veuillez réessayer plus tard.';
+            }
+        }
+    }
+}
+?>
 <!--
 =========================================================
 * Soft UI Dashboard Tailwind - v1.0.5
@@ -107,7 +213,7 @@
             <li>
               <a
                 class="block px-4 py-2 mr-2 font-normal text-white transition-all duration-250 lg-max:opacity-0 lg-max:text-slate-700 ease-soft-in-out text-sm lg:px-2 lg:hover:text-white/75"
-                href="../pages/sign-up.html">
+                href="../pages/sign-up.php">
                 <i
                   class="mr-1 text-white lg-max:text-slate-700 fas fa-user-circle opacity-60"></i>
                 Sign Up
@@ -273,38 +379,65 @@
                   </div>
                 </div>
                 <div class="flex-auto p-6">
-                  <form role="form text-left">
+                <?php if (!empty($errors)) : ?>
+                  <div class="px-4 py-3 mb-4 text-sm text-white bg-gradient-to-tl from-red-600 to-rose-400 rounded-lg">
+                    <ul class="pl-4 ml-2 space-y-1 list-disc">
+                    <?php foreach ($errors as $error) : ?>
+                      <li><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></li>
+                    <?php endforeach; ?>
+                    </ul>
+                  </div>
+                <?php endif; ?>
+                <?php if ($successMessage !== null) : ?>
+                  <div class="px-4 py-3 mb-4 text-sm text-white bg-gradient-to-tl from-emerald-500 to-lime-400 rounded-lg">
+                    <?php echo htmlspecialchars($successMessage, ENT_QUOTES, 'UTF-8'); ?>
+                  </div>
+                <?php endif; ?>
+                  <form method="post" class="text-left" role="form">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8'); ?>" />
                     <div class="mb-4">
                       <input
                         type="text"
+                        name="name"
+                        id="name"
+                        value="<?php echo htmlspecialchars($nameValue, ENT_QUOTES, 'UTF-8'); ?>"
                         class="text-sm focus:shadow-soft-primary-outline leading-5.6 ease-soft block w-full appearance-none rounded-lg border border-solid border-gray-300 bg-white bg-clip-padding py-2 px-3 font-normal text-gray-700 transition-all focus:border-fuchsia-300 focus:bg-white focus:text-gray-700 focus:outline-none focus:transition-shadow"
                         placeholder="Name"
                         aria-label="Name"
-                        aria-describedby="email-addon" />
+                        autocomplete="name"
+                        maxlength="<?php echo $nameMaximumLength; ?>"
+                        required />
                     </div>
                     <div class="mb-4">
                       <input
                         type="email"
+                        name="email"
+                        id="email"
+                        value="<?php echo htmlspecialchars($emailValue, ENT_QUOTES, 'UTF-8'); ?>"
                         class="text-sm focus:shadow-soft-primary-outline leading-5.6 ease-soft block w-full appearance-none rounded-lg border border-solid border-gray-300 bg-white bg-clip-padding py-2 px-3 font-normal text-gray-700 transition-all focus:border-fuchsia-300 focus:bg-white focus:text-gray-700 focus:outline-none focus:transition-shadow"
                         placeholder="Email"
                         aria-label="Email"
-                        aria-describedby="email-addon" />
+                        autocomplete="email"
+                        required />
                     </div>
                     <div class="mb-4">
                       <input
                         type="password"
+                        name="password"
+                        id="password"
                         class="text-sm focus:shadow-soft-primary-outline leading-5.6 ease-soft block w-full appearance-none rounded-lg border border-solid border-gray-300 bg-white bg-clip-padding py-2 px-3 font-normal text-gray-700 transition-all focus:border-fuchsia-300 focus:bg-white focus:text-gray-700 focus:outline-none focus:transition-shadow"
                         placeholder="Password"
                         aria-label="Password"
-                        aria-describedby="password-addon" />
+                        autocomplete="new-password"
+                        required />
                     </div>
                     <div class="min-h-6 pl-6.92 mb-0.5 block">
                       <input
                         id="terms"
+                        name="terms"
                         class="w-4.92 h-4.92 ease-soft -ml-6.92 rounded-1.4 checked:bg-gradient-to-tl checked:from-gray-900 checked:to-slate-800 after:text-xxs after:font-awesome after:duration-250 after:ease-soft-in-out duration-250 relative float-left mt-1 cursor-pointer appearance-none border border-solid border-slate-200 bg-white bg-contain bg-center bg-no-repeat align-top transition-all after:absolute after:flex after:h-full after:w-full after:items-center after:justify-center after:text-white after:opacity-0 after:transition-all after:content-['\f00c'] checked:border-0 checked:border-transparent checked:bg-transparent checked:after:opacity-100"
                         type="checkbox"
-                        value=""
-                        checked />
+                        value="1" <?php echo $termsAccepted ? 'checked' : ''; ?> />
                       <label
                         class="mb-2 ml-1 font-normal cursor-pointer select-none text-sm text-slate-700"
                         for="terms">
@@ -316,7 +449,7 @@
                     </div>
                     <div class="text-center">
                       <button
-                        type="button"
+                        type="submit"
                         class="inline-block w-full px-6 py-3 mt-6 mb-2 font-bold text-center text-white uppercase align-middle transition-all bg-transparent border-0 rounded-lg cursor-pointer active:opacity-85 hover:scale-102 hover:shadow-soft-xs leading-pro text-xs ease-soft-in tracking-tight-soft shadow-soft-md bg-150 bg-x-25 bg-gradient-to-tl from-gray-900 to-slate-800 hover:border-slate-700 hover:bg-slate-700 hover:text-white">
                         Sign up
                       </button>
